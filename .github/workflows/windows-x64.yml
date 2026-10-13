@@ -1,0 +1,74 @@
+name: Windows x64 release build
+
+on:
+  push:
+    branches:
+      - build/windows-x64
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows x64 (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile game, disc builder and viewer
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc -p piney-game -p piney-build -p piney-viewer
+          if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed" }
+
+      - name: Package Windows executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "target/x86_64-pc-windows-msvc/release"
+          $out = "dist/piney_apples-windows-x64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($bin in @("piney-game.exe", "piney-build.exe", "piney-viewer.exe")) {
+            $source = Join-Path $target $bin
+            if (-not (Test-Path $source)) { throw "Missing executable: $source" }
+            Copy-Item $source $out
+          }
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $out
+          @'
+          Windows x64 native Rust build of 7EKK/piney_apples.
+
+          1. Supply your own North American .hack PS2 disc image(s).
+          2. In PowerShell: .\piney-build.exe "C:\path\to\infection.iso"
+          3. Launch: .\piney-game.exe
+          4. Optional scene viewer: .\piney-viewer.exe
+
+          You can also run a single ISO using:
+            .\piney-game.exe --iso "C:\path\to\infection.iso"
+
+          No copyrighted disc images or derived assets are included.
+          Read README.md for full usage details.
+          '@ | Set-Content -Path (Join-Path $out "WINDOWS-README.txt")
+          $hashes = Get-ChildItem -Path $out -Filter "*.exe" | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash)  $($_.Name)"
+          }
+          $hashes | Set-Content -Path (Join-Path $out "SHA256SUMS.txt")
+          Compress-Archive -Path "$out/*" -DestinationPath "dist/piney_apples-windows-x64.zip" -CompressionLevel Optimal -Force
+
+      - name: Upload release ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: piney_apples-windows-x64
+          path: dist/piney_apples-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
