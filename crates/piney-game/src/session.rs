@@ -6930,6 +6930,9 @@ mod tests {
     mod item_list;
     mod kept_dummies;
 
+    /// Issue #65: Kite left standing in Carmina Gadelica.
+    mod idle_town;
+
     /// Issue #63: every walking PC's Talk, every box a line of its own.
     mod pc_talk;
 
