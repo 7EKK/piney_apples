@@ -501,6 +501,70 @@ impl App {
         }
     }
 
+    /// The window's surface on a new device, the GS put on it: the first
+    /// one, or another after the last was lost ([`Gs::lost`]).
+    fn open_display(&mut self, window: Arc<Window>) -> Result<Display, String> {
+        let instance = self.instance.get_or_insert_with(|| {
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(self.display.clone())))
+        });
+        let surface = instance.create_surface(window.clone()).map_err(|e| e.to_string())?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+            apply_limit_buckets: false,
+        }))
+        .map_err(|e| e.to_string())?;
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor { label: Some("piney"), ..Default::default() }),
+        )
+        .map_err(|e| e.to_string())?;
+        let size = window.inner_size();
+        let mut config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .ok_or("the surface is not supported by this adapter")?;
+        let caps = surface.get_capabilities(&adapter);
+        if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
+            config.format = *f;
+        }
+        config.present_mode = present_mode(self.vsync);
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
+        surface.configure(&device, &config);
+        let presenter = Presenter::new(&device, config.format);
+        let gs = match self.gs.take() {
+            Some(gs) => gs.renewed(device, queue),
+            None => {
+                let assets = self.assets.take().ok_or("assets already taken")?;
+                let mut gs = Gs::new(device, queue, assets);
+                gs.set_scale(self.render_scale);
+                gs
+            }
+        };
+        self.gs = Some(gs);
+        Ok(Display { window, surface, config, presenter })
+    }
+
+    /// Issue #65: a device lost (a driver reset, say) is made again, the
+    /// game going on; the picture comes back with the next frame.
+    fn renew_lost_device(&mut self) {
+        if !self.gs.as_ref().is_some_and(Gs::lost) {
+            return;
+        }
+        let Some(w) = self.win.take() else { return };
+        tracing::warn!("the GPU device was lost: making another");
+        let window = w.window.clone();
+        drop(w);
+        match self.open_display(window) {
+            Ok(w) => self.win = Some(w),
+            Err(e) => {
+                tracing::error!("no GPU after the device was lost: {e}");
+                self.exit = true;
+            }
+        }
+    }
+
     fn present(&mut self) {
         let (Some(gs), Some(w)) = (&self.gs, &mut self.win) else { return };
         let frame = match w.surface.get_current_texture() {
@@ -533,42 +597,7 @@ impl ApplicationHandler for App {
             .with_title(if self.launching { "piney".to_string() } else { format!("piney - {}", self.volume.title()) })
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let instance = self.instance.get_or_insert_with(|| {
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(self.display.clone())))
-        });
-        let result = (|| -> Result<Display, String> {
-            let surface = instance.create_surface(window.clone()).map_err(|e| e.to_string())?;
-            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-                apply_limit_buckets: false,
-            }))
-            .map_err(|e| e.to_string())?;
-            let (device, queue) = pollster::block_on(
-                adapter.request_device(&wgpu::DeviceDescriptor { label: Some("piney"), ..Default::default() }),
-            )
-            .map_err(|e| e.to_string())?;
-            let size = window.inner_size();
-            let mut config = surface
-                .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-                .ok_or("the surface is not supported by this adapter")?;
-            let caps = surface.get_capabilities(&adapter);
-            if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
-                config.format = *f;
-            }
-            config.present_mode = present_mode(self.vsync);
-            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-                config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
-            }
-            surface.configure(&device, &config);
-            let presenter = Presenter::new(&device, config.format);
-            let assets = self.assets.take().ok_or("assets already taken")?;
-            let mut gs = Gs::new(device, queue, assets);
-            gs.set_scale(self.render_scale);
-            self.gs = Some(gs);
-            Ok(Display { window: window.clone(), surface, config, presenter })
-        })();
+        let result = self.open_display(window.clone());
         match result {
             Ok(w) => self.win = Some(w),
             Err(e) => {
@@ -644,6 +673,7 @@ impl ApplicationHandler for App {
                 MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
             }),
             WindowEvent::RedrawRequested => {
+                self.renew_lost_device();
                 self.tick();
                 self.present();
                 self.presented = Instant::now();

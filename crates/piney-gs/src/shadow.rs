@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 
 use piney_draw::ShadowPass;
-use wgpu::util::DeviceExt;
 
 /// The main target's Z, as `render` keeps it: z / 2^32 in a float.
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -349,6 +348,7 @@ impl ShadowGpu {
     pub fn run(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         frame: &wgpu::TextureView,
         frame_depth: &wgpu::TextureView,
@@ -371,11 +371,7 @@ impl ShadowGpu {
                 scale: scale as f32,
                 pad: 0.0,
             };
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("shadow"),
-                contents: bytemuck::bytes_of(&u),
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
+            crate::filled(device, queue, "shadow", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&u))
         };
         let bind = |layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, buffer: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -433,11 +429,13 @@ impl ShadowGpu {
             if verts.is_empty() {
                 continue;
             }
-            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("shadow polygons"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+            let vb = crate::filled(
+                device,
+                queue,
+                "shadow polygons",
+                wgpu::BufferUsages::VERTEX,
+                bytemuck::cast_slice(&verts),
+            );
             {
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("shadow count"),

@@ -6,6 +6,8 @@
 //! texture ends the render pass and copies its rectangle. Not modelled: a
 //! failing alpha test's FB_ONLY / RGB_ONLY sparing depth and alpha (here they
 //! write them with the colour), dithering, 8-bit rounding in the pipeline.
+//! The frame's vertices go in kept buffers within the device's size limit;
+//! a lost device stops the drawing until [`Gs::renewed`] (worklog 408).
 
 pub mod assets;
 pub mod convert;
@@ -15,6 +17,7 @@ mod shadow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::Mat4;
 use piney_data::archive::Archive;
@@ -354,6 +357,14 @@ pub struct Gs {
     /// Not the GS's: the frame buffer this many times the frame's size each
     /// way ([`Gs::set_scale`]); the draws keep the frame's coordinates.
     scale: u32,
+    /// The last frame's vertices, for timing tools and tests.
+    vertices: usize,
+    /// The vertex buffers, kept from frame to frame: each holds the next
+    /// `chunk` vertices of the frame, within the device's buffer size.
+    vertex_buffers: Vec<wgpu::Buffer>,
+    chunk: usize,
+    /// Set when the device is lost (or out of memory): [`Gs::lost`].
+    lost: Arc<AtomicBool>,
     pub assets: Assets,
 }
 
@@ -391,6 +402,8 @@ impl Gs {
         let white = upload(&device, &queue, &tex_layout, &samplers, 1, 1, &[255; 4]);
         let shadow = shadow::ShadowGpu::new(&device, TARGET_FORMAT);
         let target = make_target(&device, piney_draw::SCREEN_WIDTH.into(), piney_draw::SCREEN_HEIGHT.into());
+        let lost = watch_loss(&device);
+        let chunk = vertex_chunk(device.limits().max_buffer_size);
         Gs {
             device,
             queue,
@@ -409,6 +422,10 @@ impl Gs {
             frame_no: 0,
             field_mode: false,
             scale: 1,
+            vertices: 0,
+            vertex_buffers: Vec::new(),
+            chunk,
+            lost,
             assets,
         }
     }
@@ -428,6 +445,20 @@ impl Gs {
         )
         .map_err(|e| e.to_string())?;
         Ok(Gs::new(device, queue, assets))
+    }
+
+    /// The same GS on a new device, after [`Gs::lost`]: the assets and the
+    /// scale kept, everything on the GPU made afresh.
+    pub fn renewed(self, device: wgpu::Device, queue: wgpu::Queue) -> Gs {
+        let mut gs = Gs::new(device, queue, self.assets);
+        gs.scale = self.scale;
+        gs
+    }
+
+    /// The device is gone (a driver reset, the GPU removed, out of
+    /// memory): nothing draws until [`Gs::renewed`] puts it on another.
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -483,8 +514,16 @@ impl Gs {
         (self.textures.len(), self.pipelines.len())
     }
 
+    /// The last frame's vertices.
+    pub fn vertices(&self) -> usize {
+        self.vertices
+    }
+
     /// Draw `frame` into the frame buffer.
     pub fn render(&mut self, frame: &Frame) {
+        if self.lost() {
+            return;
+        }
         let (w, h) = (u32::from(frame.width.max(1)), u32::from(frame.height.max(1)));
         // The frame buffer's pixels: the frame's at the scale.
         let k = self.scale;
@@ -719,13 +758,8 @@ impl Gs {
             }
         }
 
-        let buffer = (!verts.is_empty()).then(|| {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gs vertices"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
+        self.vertices = verts.len();
+        self.fill_vertex_buffers(&verts);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // The last frame's picture, taken before this frame clears it.
         if uses_previous {
@@ -778,24 +812,21 @@ impl Gs {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                if let Some(buffer) = &buffer {
-                    pass.set_vertex_buffer(0, buffer.slice(..));
-                    for d in &draws[next..stop] {
-                        // SCISSOR_1, inclusive, within the frame buffer.
-                        let s = d.scissor;
-                        let (x0, y0) = ((u32::from(s.x0) * k).min(pw), (u32::from(s.y0) * k).min(ph));
-                        let (x1, y1) = (((u32::from(s.x1) + 1) * k).min(pw), ((u32::from(s.y1) + 1) * k).min(ph));
-                        if x1 <= x0 || y1 <= y0 {
-                            continue;
-                        }
-                        pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
-                        pass.set_pipeline(&self.pipelines[&d.pipe]);
-                        let tex = d.tex.as_ref().and_then(|k| self.bound(k)).unwrap_or(&self.white);
-                        pass.set_bind_group(0, &tex.groups[d.sampler], &[]);
-                        let f = f64::from(d.fix) / 128.0;
-                        pass.set_blend_constant(wgpu::Color { r: f, g: f, b: f, a: f });
-                        pass.draw(d.first..d.first + d.count, 0..1);
+                for d in &draws[next..stop] {
+                    // SCISSOR_1, inclusive, within the frame buffer.
+                    let s = d.scissor;
+                    let (x0, y0) = ((u32::from(s.x0) * k).min(pw), (u32::from(s.y0) * k).min(ph));
+                    let (x1, y1) = (((u32::from(s.x1) + 1) * k).min(pw), ((u32::from(s.y1) + 1) * k).min(ph));
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
                     }
+                    pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
+                    pass.set_pipeline(&self.pipelines[&d.pipe]);
+                    let tex = d.tex.as_ref().and_then(|k| self.bound(k)).unwrap_or(&self.white);
+                    pass.set_bind_group(0, &tex.groups[d.sampler], &[]);
+                    let f = f64::from(d.fix) / 128.0;
+                    pass.set_blend_constant(wgpu::Color { r: f, g: f, b: f, a: f });
+                    self.draw_chunked(&mut pass, d.first..d.first + d.count);
                 }
             }
             (next, clear) = (stop, false);
@@ -806,7 +837,7 @@ impl Gs {
             // sees them, as it follows them in the list), then the copies.
             while let Some((_, sh)) = pending_shadows.next_if(|s| s.0 == stop) {
                 let depth = self.target.depth_texture.create_view(&Default::default());
-                self.shadow.run(&self.device, &mut encoder, &self.target.view, &depth, (pw, ph), k, sh);
+                self.shadow.run(&self.device, &self.queue, &mut encoder, &self.target.view, &depth, (pw, ph), k, sh);
             }
             while let Some((n, c)) = pending.next_if(|(_, c)| c.before == stop) {
                 let (x, y) = (c.x * k as i32, c.y * k as i32);
@@ -814,6 +845,44 @@ impl Gs {
             }
         }
         self.queue.submit([encoder.finish()]);
+    }
+
+    /// The frame's vertices into the kept buffers, `chunk` to a buffer; a
+    /// buffer too small is made again, twice what is needed up to the chunk.
+    fn fill_vertex_buffers(&mut self, verts: &[GVertex]) {
+        let unit = std::mem::size_of::<GVertex>() as u64;
+        for (n, part) in verts.chunks(self.chunk).enumerate() {
+            let need = part.len() as u64 * unit;
+            if self.vertex_buffers.get(n).is_none_or(|b| b.size() < need) {
+                let size = need.next_power_of_two().min(self.chunk as u64 * unit);
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("gs vertices"),
+                    size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                match self.vertex_buffers.get_mut(n) {
+                    Some(b) => *b = buffer,
+                    None => self.vertex_buffers.push(buffer),
+                }
+            }
+            self.queue.write_buffer(&self.vertex_buffers[n], 0, bytemuck::cast_slice(part));
+        }
+    }
+
+    /// Draw the frame's vertices `range`, from each buffer it lies in. The
+    /// chunk is whole triangles and every draw starts on one, so a draw
+    /// split between two buffers splits between triangles.
+    fn draw_chunked(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
+        let chunk = self.chunk as u32;
+        let mut at = range.start;
+        while at < range.end {
+            let n = at / chunk;
+            let end = range.end.min((n + 1) * chunk);
+            pass.set_vertex_buffer(0, self.vertex_buffers[n as usize].slice(..));
+            pass.draw(at - n * chunk..end - n * chunk, 0..1);
+            at = end;
+        }
     }
 
     /// The texture a draw binds.
@@ -876,6 +945,9 @@ impl Gs {
     /// The frame buffer as RGBA8 rows, top first.
     pub fn read_back(&self) -> Vec<u8> {
         let (width, height) = (self.target.width, self.target.height);
+        if self.lost() {
+            return [0, 0, 0, 255].repeat((width * height) as usize);
+        }
         let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
@@ -902,9 +974,13 @@ impl Gs {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        readback.map_async(wgpu::MapMode::Read, .., |r| r.expect("map readback"));
-        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        let data = readback.get_mapped_range(..).expect("mapped range");
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        let polled = self.device.poll(wgpu::PollType::wait_indefinitely());
+        // A lost device reads back black.
+        let black = || [0, 0, 0, 255].repeat((width * height) as usize);
+        let Ok(data) = polled.map_err(|_| ()).and_then(|_| readback.get_mapped_range(..).map_err(|_| ())) else {
+            return black();
+        };
         let mut out = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height as usize {
             out.extend_from_slice(&data[y * row as usize..y * row as usize + width as usize * 4]);
@@ -913,6 +989,62 @@ impl Gs {
         out.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[3] = 255);
         out
     }
+}
+
+/// A buffer holding `contents`, written through the queue rather than
+/// mapped at creation: on a lost device the write fails quietly, where a
+/// mapping panics.
+pub(crate) fn filled(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    usage: wgpu::BufferUsages,
+    contents: &[u8],
+) -> wgpu::Buffer {
+    let size = (contents.len() as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT).max(wgpu::COPY_BUFFER_ALIGNMENT);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut padded = contents.to_vec();
+    padded.resize(size as usize, 0);
+    queue.write_buffer(&buffer, 0, &padded);
+    buffer
+}
+
+/// Vertices per vertex buffer: as many whole triangles as a buffer of the
+/// device's largest size holds.
+fn vertex_chunk(max_buffer_size: u64) -> usize {
+    let n = max_buffer_size / std::mem::size_of::<GVertex>() as u64;
+    (n.min(u64::from(u32::MAX)) as usize / 3 * 3).max(3)
+}
+
+/// A flag the device sets when it is lost. Once it is, what it is still
+/// asked to do fails with errors that are logged, not fatal (they would
+/// panic by default); out of memory counts as lost. Any other error panics
+/// as wgpu's own handler does.
+fn watch_loss(device: &wgpu::Device) -> Arc<AtomicBool> {
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = lost.clone();
+    device.set_device_lost_callback(move |reason, message| {
+        if reason != wgpu::DeviceLostReason::Destroyed || !message.is_empty() {
+            tracing::error!("gs: the device is lost ({reason:?}): {message}");
+        }
+        flag.store(true, Ordering::Release);
+    });
+    let flag = lost.clone();
+    device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+        if matches!(e, wgpu::Error::OutOfMemory { .. }) {
+            flag.store(true, Ordering::Release);
+        }
+        if !flag.load(Ordering::Acquire) {
+            panic!("wgpu error: {e}");
+        }
+        tracing::warn!("gs: on a lost device: {e}");
+    }));
+    lost
 }
 
 /// Finish a draw whose vertices run from `draw.first` to the end of
@@ -1489,6 +1621,110 @@ mod tests {
         let added = pixel(&img, w, 55, 15)[0];
         assert!((0x5f..=0x61).contains(&added), "{added:#x}");
         assert_eq!(pixel(&img, w, 75, 15), [0x40, 0x40, 0x40, 255]);
+    }
+
+    /// A GS on a device of the first adapter whose buffers may be at most
+    /// `max_buffer_size` bytes.
+    fn gs_limited(max_buffer_size: u64) -> Option<Gs> {
+        let assets = gs()?.assets;
+        let (device, queue) = device(wgpu::Limits { max_buffer_size, ..Default::default() })?;
+        Some(Gs::new(device, queue, assets))
+    }
+
+    /// A device of the first adapter with `required_limits`.
+    fn device(required_limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        let desc = wgpu::DeviceDescriptor { required_limits, ..Default::default() };
+        pollster::block_on(adapter.request_device(&desc)).ok()
+    }
+
+    /// 3000 sprites, then one prim of 3000 triangles, each in a 4 x 4 cell
+    /// of its own colour: 27,000 vertices.
+    fn many_cells() -> Frame {
+        let mut frame = Frame::new();
+        let state = DrawState { blend: None, ..DrawState::sprite(Blend::MIX, None) };
+        let cell = |n: usize, top: f32| ((n % 128) as f32 * 4.0, top + (n / 128) as f32 * 4.0);
+        let colour = |n: usize| Rgba::new((n * 7) as u8, ((n * 13) >> 2) as u8, (n >> 4) as u8 | 0x80, 0x80);
+        for n in 0..3000 {
+            let (x, y) = cell(n, 0.0);
+            frame.cmds.push(rect(x, y, x + 4.0, y + 4.0, colour(n), state.clone()));
+        }
+        let verts = (0..3000)
+            .flat_map(|n| {
+                let (x, y) = cell(n, 100.0);
+                let v = |x, y| Vertex { x, y, rgba: colour(n), ..Default::default() };
+                [v(x, y), v(x + 4.0, y), v(x, y + 4.0)]
+            })
+            .collect();
+        frame.cmds.push(Cmd::Prim(Prim { kind: PrimKind::Triangles, gouraud: false, state, verts }));
+        frame
+    }
+
+    /// Issue #65: a frame needs more vertex memory than one buffer may
+    /// hold. Here a buffer holds 18,723 vertices (1 MiB); the frame is
+    /// drawn from two, the triangles' prim split between them, and the
+    /// picture is the one a single buffer draws.
+    #[test]
+    fn a_frame_past_the_buffer_limit_draws_whole() {
+        let (Some(mut whole), Some(mut limited)) = (gs(), gs_limited(1 << 20)) else { return };
+        let frame = many_cells();
+        whole.render(&frame);
+        limited.render(&frame);
+        assert_eq!(limited.vertices(), 27_000);
+        assert_eq!((whole.vertex_buffers.len(), limited.vertex_buffers.len()), (1, 2));
+        assert_eq!(limited.chunk, 18_723);
+        let img = limited.read_back();
+        assert!(img == whole.read_back(), "the split frame draws as the whole one");
+        // The seam is (18,723 - 18,000) / 3 = 241 triangles into the prim:
+        // triangle 240 is the first buffer's last, 241 the second's first.
+        let w = limited.target_size().0;
+        let Cmd::Prim(p) = &frame.cmds[3000] else { unreachable!() };
+        for t in [240, 241] {
+            let [r, g, b, _] = p.verts[t * 3].rgba.0;
+            let (x, y) = ((t % 128) as u32 * 4, 100 + (t / 128) as u32 * 4);
+            assert_eq!(pixel(&img, w, x, y), [r, g, b, 255], "triangle {t}");
+        }
+    }
+
+    /// Issue #65's panic: `create_buffer_init` on a lost device, as the
+    /// GS made its vertex buffer, fails to map the invalid buffer. The GS
+    /// now writes its buffers through the queue, stops drawing once the
+    /// device is lost, and draws again on a new one.
+    #[test]
+    fn a_lost_device_stops_the_drawing_and_a_new_one_resumes_it() {
+        let (Some(mut gs), Some((device, queue))) = (gs(), device(Default::default())) else { return };
+        let frame = many_cells();
+        gs.render(&frame);
+        gs.device().destroy();
+        gs.device().poll(wgpu::PollType::wait_indefinitely()).ok();
+        assert!(gs.lost());
+        // What wgpu's own helper does on it.
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gs.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gs vertices"),
+                contents: &[0; 56],
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        }));
+        let panic = made.err().and_then(|e| e.downcast::<String>().ok()).expect("create_buffer_init panics");
+        assert!(panic.contains("Buffer with 'gs vertices' label is invalid"), "{panic}");
+        // The GS's own writes fail quietly.
+        let verts = vec![GVertex::default(); 30_000];
+        gs.fill_vertex_buffers(&verts);
+        filled(gs.device(), gs.queue(), "shadow", wgpu::BufferUsages::UNIFORM, &[0; 48]);
+        gs.render(&frame);
+        assert!(gs.read_back().as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]));
+        // On another device it draws again.
+        gs.set_scale(2);
+        let mut gs = gs.renewed(device, queue);
+        assert!(!gs.lost());
+        assert_eq!(gs.scale(), 2);
+        gs.render(&frame);
+        let img = gs.read_back();
+        let Cmd::Prim(p) = &frame.cmds[5] else { unreachable!() };
+        let [r, g, b, _] = p.verts[0].rgba.0;
+        assert_eq!(pixel(&img, gs.target_size().0, 5 * 4 * 2 + 1, 1), [r, g, b, 255]);
     }
 
     /// A movie uploads a new true-colour picture every frame; only the
